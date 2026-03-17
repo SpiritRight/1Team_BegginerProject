@@ -11,24 +11,25 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
-try:
-    import torch
-    from PIL import Image
-    from torch.utils.data import DataLoader, Dataset
-    from torchvision.models.detection import fasterrcnn_resnet50_fpn
-    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-    from torchvision.transforms import ToTensor
+from train_resnet_args import parse_args
 
-    _IMPORT_ERROR = None
-except Exception as exc:  # pragma: no cover - import guard for help/argparse usage
-    torch = None
-    Image = None
-    DataLoader = None
-    Dataset = object
-    fasterrcnn_resnet50_fpn = None
-    FastRCNNPredictor = None
-    ToTensor = None
-    _IMPORT_ERROR = exc
+import numpy as np
+import torch
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
+from torchvision.models.detection import fasterrcnn_resnet50_fpn
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.transforms import ToTensor
+
+
+
+try:
+    import wandb
+
+    _WANDB_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - optional dependency
+    wandb = None
+    _WANDB_IMPORT_ERROR = exc
 
 
 @dataclass
@@ -43,102 +44,6 @@ class ImageAnnotation:
     width: int
     height: int
     objects: List[ObjectAnnotation]
-
-
-def resolve_path(root: Path, value: Path) -> Path:
-    return value if value.is_absolute() else (root / value)
-
-
-def parse_args() -> argparse.Namespace:
-    default_root = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(
-        description="Faster R-CNN (ResNet-50-FPN) baseline using merged annotations."
-    )
-    parser.add_argument("--root", type=Path, default=default_root, help="Project root.")
-    parser.add_argument(
-        "--ann-dir",
-        type=Path,
-        default=Path("data/new_merged_annonation/new_merged_annonation"),
-        help="Merged annotation directory.",
-    )
-    parser.add_argument(
-        "--train-img-dir",
-        type=Path,
-        default=Path("data/train_images"),
-        help="Training image directory.",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("runs/resnet_baseline_new_merged"),
-        help="Output directory for checkpoints and logs.",
-    )
-    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation split ratio.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--epochs", type=int, default=20, help="Number of epochs.")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size.")
-    parser.add_argument("--num-workers", type=int, default=2, help="DataLoader workers.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="Weight decay.")
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        default="sgd",
-        choices=["sgd", "adamw"],
-        help="Optimizer type.",
-    )
-    parser.add_argument("--momentum", type=float, default=0.9, help="Momentum for SGD.")
-    parser.add_argument("--step-size", type=int, default=8, help="StepLR step_size.")
-    parser.add_argument("--gamma", type=float, default=0.1, help="StepLR gamma.")
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="",
-        help='Training device, e.g. "cuda", "cuda:0", "cpu". Auto-detect if empty.',
-    )
-    parser.add_argument(
-        "--pretrained",
-        action="store_true",
-        default=True,
-        help="Use torchvision pretrained Faster R-CNN backbone/head init.",
-    )
-    parser.add_argument(
-        "--no-pretrained",
-        action="store_false",
-        dest="pretrained",
-        help="Disable pretrained weights.",
-    )
-    parser.add_argument("--amp", action="store_true", help="Use mixed precision on CUDA.")
-    parser.add_argument("--log-interval", type=int, default=20, help="Step log interval.")
-    parser.add_argument(
-        "--eval-score-thr",
-        type=float,
-        default=0.001,
-        help="Score threshold for validation mAP computation.",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Build dataset/model and exit before training.",
-    )
-    parser.add_argument(
-        "--resume",
-        type=Path,
-        default=None,
-        help="Checkpoint path to resume from.",
-    )
-    args = parser.parse_args()
-
-    args.root = args.root.resolve()
-    args.ann_dir = resolve_path(args.root, args.ann_dir).resolve()
-    args.train_img_dir = resolve_path(args.root, args.train_img_dir).resolve()
-    args.output_dir = resolve_path(args.root, args.output_dir).resolve()
-    if args.resume is not None:
-        args.resume = resolve_path(args.root, args.resume).resolve()
-
-    if not (0.0 < args.val_ratio < 1.0):
-        raise ValueError("--val-ratio must be between 0 and 1.")
-    return args
 
 
 def load_merged_annotations(
@@ -227,6 +132,33 @@ def split_entries(
     val_entries = sorted(entries[:val_size], key=lambda x: x.file_name)
     train_entries = sorted(entries[val_size:], key=lambda x: x.file_name)
     return train_entries, val_entries
+
+
+def set_global_seed(seed: int) -> None:
+    random.seed(seed)
+    if np is not None:
+        np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass
+
+
+def seed_worker(worker_id: int) -> None:
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    if np is not None:
+        np.random.seed(worker_seed)
 
 
 def clip_xywh_to_xyxy(
@@ -565,19 +497,25 @@ def save_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def build_wandb_config(args: argparse.Namespace) -> dict:
+    payload = {}
+    for key, value in vars(args).items():
+        if isinstance(value, Path):
+            payload[key] = str(value)
+        else:
+            payload[key] = value
+    return payload
+
+
 def main() -> None:
     args = parse_args()
-
-    if _IMPORT_ERROR is not None:
-        raise RuntimeError(
-            "PyTorch/torchvision/Pillow is not installed. Install first:\n"
-            "  pip install torch torchvision pillow"
-        ) from _IMPORT_ERROR
 
     if not args.ann_dir.exists():
         raise FileNotFoundError(f"Annotation dir not found: {args.ann_dir}")
     if not args.train_img_dir.exists():
         raise FileNotFoundError(f"Train image dir not found: {args.train_img_dir}")
+
+    set_global_seed(args.seed)
 
     entries, class_id_to_name = load_merged_annotations(args.ann_dir)
     train_entries, val_entries = split_entries(entries, args.val_ratio, args.seed)
@@ -601,12 +539,18 @@ def main() -> None:
 
     train_dataset = PillDetectionDataset(train_entries, args.train_img_dir)
     val_dataset = PillDetectionDataset(val_entries, args.train_img_dir)
+    train_generator = torch.Generator()
+    train_generator.manual_seed(args.seed)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(args.seed + 1)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
+        worker_init_fn=seed_worker,
+        generator=train_generator,
         collate_fn=collate_fn,
     )
     val_loader = DataLoader(
@@ -614,6 +558,8 @@ def main() -> None:
         batch_size=max(1, args.batch_size // 2),
         shuffle=False,
         num_workers=args.num_workers,
+        worker_init_fn=seed_worker,
+        generator=val_generator,
         collate_fn=collate_fn,
     )
 
@@ -667,6 +613,7 @@ def main() -> None:
     print(f"num_classes   : {num_classes} (+1 background)")
     print(f"train_images  : {len(train_entries)}")
     print(f"val_images    : {len(val_entries)}")
+    print(f"seed          : {args.seed}")
     print(f"device        : {device}")
     print(f"optimizer     : {args.optimizer}")
     print(f"epochs        : {args.epochs}")
@@ -676,62 +623,120 @@ def main() -> None:
         print("Dry run complete. Exiting before training.")
         return
 
-    for epoch in range(start_epoch, args.epochs + 1):
-        epoch_start = time.time()
-        train_loss = train_one_epoch(
-            model=model,
-            data_loader=train_loader,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-            log_interval=args.log_interval,
-            scaler=scaler,
-        )
-        val_loss = validate_one_epoch(model=model, data_loader=val_loader, device=device)
-        val_map75_95, val_map_by_iou = evaluate_map75_95(
-            model=model,
-            data_loader=val_loader,
-            device=device,
-            num_classes_without_bg=num_classes,
-            score_thr=args.eval_score_thr,
-        )
-        scheduler.step()
-        elapsed = time.time() - epoch_start
+    wandb_run = None
+    if args.use_wandb:
+        if _WANDB_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "wandb is not installed. Install first:\n"
+                "  pip install wandb"
+            ) from _WANDB_IMPORT_ERROR
 
-        print(
-            f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} "
-            f"val_loss={val_loss:.4f} val_mAP75-95={val_map75_95:.4f} "
-            f"time={elapsed:.1f}s"
-        )
-        print(f"  val mAP by IoU: {val_map_by_iou}")
-
-        state = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "best_val_loss": min(best_val_loss, val_loss),
-            "val_map75_95": val_map75_95,
-            "val_map_by_iou": val_map_by_iou,
-            "best_map75_95": max(best_map75_95, val_map75_95),
-            "num_classes_without_bg": num_classes,
-            "class_id_to_name": class_id_to_name,
-            "label_offset": 1,
-            "args": vars(args),
+        tags = [x.strip() for x in args.wandb_tags.split(",") if x.strip()]
+        wandb_kwargs = {
+            "project": args.wandb_project,
+            "config": build_wandb_config(args),
+            "mode": args.wandb_mode,
         }
-        torch.save(state, ckpt_dir / "last.pt")
+        if args.wandb_entity:
+            wandb_kwargs["entity"] = args.wandb_entity
+        if args.wandb_run_name:
+            wandb_kwargs["name"] = args.wandb_run_name
+        if args.wandb_group:
+            wandb_kwargs["group"] = args.wandb_group
+        if tags:
+            wandb_kwargs["tags"] = tags
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(state, ckpt_dir / "best.pt")
-            print(f"  -> best checkpoint updated: {ckpt_dir / 'best.pt'}")
+        wandb_run = wandb.init(**wandb_kwargs)
+        wandb.config.update(
+            {
+                "num_classes_without_bg": num_classes,
+                "train_images": len(train_entries),
+                "val_images": len(val_entries),
+                "used_pretrained": used_pretrained,
+            },
+            allow_val_change=True,
+        )
+        print(f"W&B enabled   : run={wandb_run.name} ({wandb_run.id})")
 
-        if val_map75_95 > best_map75_95:
-            best_map75_95 = val_map75_95
-            torch.save(state, ckpt_dir / "best_map.pt")
-            print(f"  -> best mAP checkpoint updated: {ckpt_dir / 'best_map.pt'}")
+    try:
+        for epoch in range(start_epoch, args.epochs + 1):
+            epoch_start = time.time()
+            train_loss = train_one_epoch(
+                model=model,
+                data_loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                epoch=epoch,
+                log_interval=args.log_interval,
+                scaler=scaler,
+            )
+            val_loss = validate_one_epoch(model=model, data_loader=val_loader, device=device)
+            val_map75_95, val_map_by_iou = evaluate_map75_95(
+                model=model,
+                data_loader=val_loader,
+                device=device,
+                num_classes_without_bg=num_classes,
+                score_thr=args.eval_score_thr,
+            )
+            scheduler.step()
+            elapsed = time.time() - epoch_start
+
+            print(
+                f"[Epoch {epoch:03d}] train_loss={train_loss:.4f} "
+                f"val_loss={val_loss:.4f} val_mAP75-95={val_map75_95:.4f} "
+                f"time={elapsed:.1f}s"
+            )
+            print(f"  val mAP by IoU: {val_map_by_iou}")
+
+            state = {
+                "epoch": epoch,
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "best_val_loss": min(best_val_loss, val_loss),
+                "val_map75_95": val_map75_95,
+                "val_map_by_iou": val_map_by_iou,
+                "best_map75_95": max(best_map75_95, val_map75_95),
+                "num_classes_without_bg": num_classes,
+                "class_id_to_name": class_id_to_name,
+                "label_offset": 1,
+                "args": vars(args),
+            }
+            if wandb_run is not None:
+                state["wandb_run_id"] = wandb_run.id
+            torch.save(state, ckpt_dir / "last.pt")
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                torch.save(state, ckpt_dir / "best.pt")
+                print(f"  -> best checkpoint updated: {ckpt_dir / 'best.pt'}")
+
+            if val_map75_95 > best_map75_95:
+                best_map75_95 = val_map75_95
+                torch.save(state, ckpt_dir / "best_map.pt")
+                print(f"  -> best mAP checkpoint updated: {ckpt_dir / 'best_map.pt'}")
+
+            if wandb_run is not None:
+                log_payload = {
+                    "epoch": epoch,
+                    "train/loss": train_loss,
+                    "val/loss": val_loss,
+                    "val/mAP75-95": val_map75_95,
+                    "best/val_loss": best_val_loss,
+                    "best/mAP75-95": best_map75_95,
+                    "time/epoch_sec": elapsed,
+                    "lr": float(optimizer.param_groups[0]["lr"]),
+                }
+                for iou_key, iou_map in val_map_by_iou.items():
+                    log_payload[f"val/mAP@{iou_key}"] = iou_map
+                wandb.log(log_payload, step=epoch)
+    finally:
+        if wandb_run is not None:
+            wandb_run.summary["best_val_loss"] = best_val_loss
+            wandb_run.summary["best_val_mAP75-95"] = best_map75_95
+            wandb.finish()
 
     print("Training finished.")
     print(f"Best val loss: {best_val_loss:.4f}")
