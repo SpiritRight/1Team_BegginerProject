@@ -9,6 +9,7 @@ Update the CONFIG section, then run:
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import re
 from dataclasses import dataclass
@@ -21,15 +22,21 @@ from typing import List, Sequence
 # =========================
 ROOT = Path(__file__).resolve().parent
 
-YOLO_WEIGHTS = ROOT / "runs/yolo_26n/best.pt"
+YOLO_WEIGHTS = ROOT / "runs/yolo_26m/yolo26m_train02_best.pt"
 TEST_IMG_DIR = ROOT / "data/test_images"
 ANN_DIR = ROOT / "data/new_merged_annonation/new_merged_annonation"
-OUTPUT_CSV = ROOT / "runs/yolo_26n/submission.csv"
+OUTPUT_CSV = ROOT / "runs/yolo_26m/submission.csv"
 
 # "" means auto (CUDA if available, else CPU)
 DEVICE = ""
-IMGSZ = 1024
-BATCH_SIZE = 8
+IMGSZ = 640
+BATCH_SIZE = 1
+PREDICT_CHUNK_SIZE = 16
+USE_FP16_ON_CUDA = True
+
+# If CUDA OOM occurs, retry with smaller imgsz and finally CPU fallback.
+AUTO_RECOVER_FROM_OOM = True
+OOM_RETRY_IMGSZ = (640, 512, 448, 384)
 
 SCORE_THR = 0.05
 NMS_IOU_THR = 0.5
@@ -152,6 +159,86 @@ def convert_category_id(
     raise ValueError(f"Unsupported category-id format: {category_id_format}")
 
 
+def is_cuda_oom_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return "out of memory" in msg and "cuda" in msg
+
+
+def build_imgsz_try_list() -> List[int]:
+    candidates: List[int] = [int(IMGSZ)]
+    for sz in OOM_RETRY_IMGSZ:
+        sz_i = int(sz)
+        if sz_i not in candidates:
+            candidates.append(sz_i)
+    # keep positive and sorted descending so quality-first retry
+    candidates = sorted([x for x in candidates if x > 0], reverse=True)
+    return candidates
+
+
+def chunked(items: Sequence, chunk_size: int):
+    if chunk_size <= 0:
+        raise ValueError("PREDICT_CHUNK_SIZE must be > 0.")
+    for start in range(0, len(items), chunk_size):
+        yield items[start : start + chunk_size]
+
+
+def predict_with_oom_recovery(model, source_paths: List[str]):
+    try:
+        import torch
+    except Exception:
+        torch = None
+
+    requested_device = DEVICE if DEVICE else None
+    use_fp16 = USE_FP16_ON_CUDA and (DEVICE == "" or str(DEVICE).startswith("cuda"))
+    imgsz_candidates = build_imgsz_try_list()
+
+    last_exc: Exception | None = None
+    for idx, imgsz in enumerate(imgsz_candidates):
+        try:
+            return model.predict(
+                source=source_paths,
+                conf=SCORE_THR,
+                iou=NMS_IOU_THR,
+                agnostic_nms=AGNOSTIC_NMS,
+                max_det=MAX_DETS_PER_IMG if MAX_DETS_PER_IMG > 0 else 30000,
+                imgsz=imgsz,
+                batch=BATCH_SIZE if idx == 0 else 1,
+                device=requested_device,
+                half=use_fp16,
+                verbose=False,
+                stream=False,
+            )
+        except RuntimeError as exc:
+            last_exc = exc
+            if not AUTO_RECOVER_FROM_OOM or not is_cuda_oom_error(exc):
+                raise
+            print(
+                f"[OOM] CUDA 메모리 부족. imgsz={imgsz}에서 실패 -> "
+                "더 작은 해상도로 재시도합니다."
+            )
+            if torch is not None and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    if not AUTO_RECOVER_FROM_OOM or last_exc is None:
+        raise RuntimeError("Prediction failed for unknown reason.")
+
+    print("[OOM] GPU 재시도 실패. CPU로 전환해서 추론합니다 (느릴 수 있음).")
+    # final fallback on CPU
+    return model.predict(
+        source=source_paths,
+        conf=SCORE_THR,
+        iou=NMS_IOU_THR,
+        agnostic_nms=AGNOSTIC_NMS,
+        max_det=MAX_DETS_PER_IMG if MAX_DETS_PER_IMG > 0 else 30000,
+        imgsz=min(build_imgsz_try_list()),
+        batch=1,
+        device="cpu",
+        half=False,
+        verbose=False,
+        stream=False,
+    )
+
+
 def run_inference_yolo(
     model,
     image_infos: List[TestImageInfo],
@@ -160,60 +247,59 @@ def run_inference_yolo(
 ) -> List[dict]:
     rows: List[dict] = []
 
-    source_paths = [str(info.path) for info in image_infos]
-    max_det = MAX_DETS_PER_IMG if MAX_DETS_PER_IMG > 0 else 30000
+    try:
+        import torch
+    except Exception:
+        torch = None
 
-    results = model.predict(
-        source=source_paths,
-        conf=SCORE_THR,
-        iou=NMS_IOU_THR,
-        agnostic_nms=AGNOSTIC_NMS,
-        max_det=max_det,
-        imgsz=IMGSZ,
-        batch=BATCH_SIZE,
-        device=DEVICE if DEVICE else None,
-        verbose=False,
-        stream=False,
-    )
+    for info_chunk in chunked(image_infos, PREDICT_CHUNK_SIZE):
+        source_paths = [str(info.path) for info in info_chunk]
+        results = predict_with_oom_recovery(model=model, source_paths=source_paths)
 
-    for info, result in zip(image_infos, results):
-        h, w = result.orig_shape[:2]
-        image_id = info.image_id
+        for info, result in zip(info_chunk, results):
+            h, w = result.orig_shape[:2]
+            image_id = info.image_id
 
-        boxes = result.boxes
-        if boxes is None or len(boxes) == 0:
-            continue
-
-        xyxy = boxes.xyxy.cpu().tolist()
-        confs = boxes.conf.cpu().tolist()
-        classes = boxes.cls.cpu().tolist()
-
-        for box, score, cls_idx in zip(xyxy, confs, classes):
-            x1, y1, x2, y2 = map(float, box)
-            x1, y1, x2, y2 = clamp_box_xyxy(x1, y1, x2, y2, width=w, height=h)
-            bw = x2 - x1
-            bh = y2 - y1
-            if bw <= 0.0 or bh <= 0.0:
+            boxes = result.boxes
+            if boxes is None or len(boxes) == 0:
                 continue
 
-            remapped_id = int(cls_idx)
-            output_category_id = convert_category_id(
-                remapped_category_id=remapped_id,
-                category_id_format=category_id_format,
-                remapped_to_original=remapped_to_original,
-            )
+            xyxy = boxes.xyxy.cpu().tolist()
+            confs = boxes.conf.cpu().tolist()
+            classes = boxes.cls.cpu().tolist()
 
-            rows.append(
-                {
-                    "image_id": image_id,
-                    "category_id": output_category_id,
-                    "bbox_x": round(x1, 4),
-                    "bbox_y": round(y1, 4),
-                    "bbox_w": round(bw, 4),
-                    "bbox_h": round(bh, 4),
-                    "score": round(float(score), 6),
-                }
-            )
+            for box, score, cls_idx in zip(xyxy, confs, classes):
+                x1, y1, x2, y2 = map(float, box)
+                x1, y1, x2, y2 = clamp_box_xyxy(x1, y1, x2, y2, width=w, height=h)
+                bw = x2 - x1
+                bh = y2 - y1
+                if bw <= 0.0 or bh <= 0.0:
+                    continue
+
+                remapped_id = int(cls_idx)
+                output_category_id = convert_category_id(
+                    remapped_category_id=remapped_id,
+                    category_id_format=category_id_format,
+                    remapped_to_original=remapped_to_original,
+                )
+
+                rows.append(
+                    {
+                        "image_id": image_id,
+                        "category_id": output_category_id,
+                        "bbox_x": round(x1, 4),
+                        "bbox_y": round(y1, 4),
+                        "bbox_w": round(bw, 4),
+                        "bbox_h": round(bh, 4),
+                        "score": round(float(score), 6),
+                    }
+                )
+
+        del results
+        gc.collect()
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     return rows
 
 
