@@ -129,7 +129,7 @@ def run_inference_and_evaluate(model_path, img_path, gt_json_dir):
             gt_data = json.load(f)
         for ann in gt_data.get('annotations', []):
             bbox = ann.get('bbox', []) # format: [x, y, w, h]
-            # Validate bbox format to prevent errors
+            # bbox 좌표가 4개인지 검증
             if isinstance(bbox, list) and len(bbox) == 4:
                 x, y, w, h = bbox
                 gt_boxes.append([x, y, x + w, y + h]) # convert to [x1, y1, x2, y2]
