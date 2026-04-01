@@ -17,24 +17,19 @@ from pathlib import Path
 from typing import List, Sequence
 
 
-# =========================
-# CONFIG (edit these values)
-# =========================
+# CONFIG
 ROOT = Path(__file__).resolve().parent
 
-YOLO_WEIGHTS = ROOT / "runs/yolo_26m/yolo26m_train02_best.pt"
+YOLO_WEIGHTS = ROOT / "runs/no_blur/no_blur.pt"
 TEST_IMG_DIR = ROOT / "data/test_images"
 ANN_DIR = ROOT / "data/new_merged_annonation/new_merged_annonation"
-OUTPUT_CSV = ROOT / "runs/yolo_26m/submission.csv"
-
-# "" means auto (CUDA if available, else CPU)
+OUTPUT_CSV = ROOT / "runs/no_blur/submission.csv"
 DEVICE = ""
 IMGSZ = 640
 BATCH_SIZE = 1
 PREDICT_CHUNK_SIZE = 16
 USE_FP16_ON_CUDA = True
 
-# If CUDA OOM occurs, retry with smaller imgsz and finally CPU fallback.
 AUTO_RECOVER_FROM_OOM = True
 OOM_RETRY_IMGSZ = (640, 512, 448, 384)
 
@@ -45,10 +40,7 @@ MAX_DETS_PER_IMG = 4
 
 EXTS = (".png", ".jpg", ".jpeg", ".bmp")
 
-# "dl_idx"/"original": original category id from merged annotation mapping
-# "train_json"/"remapped": YOLO class index (0..N-1)
-# "one_based": YOLO class index + 1
-CATEGORY_ID_FORMAT = "dl_idx"  # ["dl_idx", "original", "train_json", "remapped", "one_based"]
+CATEGORY_ID_FORMAT = "dl_idx" 
 
 
 @dataclass(frozen=True)
@@ -58,7 +50,6 @@ class TestImageInfo:
 
 
 def parse_image_id_from_name(path: Path) -> int:
-    # Submission rule: image_id must match numeric part of file name.
     match = re.search(r"\d+", path.stem)
     if match is None:
         raise ValueError(f"Cannot parse numeric image_id from file name: {path.name}")
@@ -116,7 +107,6 @@ def load_remapped_to_original_id_map(ann_dir: Path) -> dict[int, int]:
         if not annotations or not categories:
             continue
 
-        # merged annotation format: each annotation has aligned category entry
         if len(annotations) == len(categories):
             for ann, cat in zip(annotations, categories):
                 remapped_id = int(ann["category_id"])
@@ -170,7 +160,6 @@ def build_imgsz_try_list() -> List[int]:
         sz_i = int(sz)
         if sz_i not in candidates:
             candidates.append(sz_i)
-    # keep positive and sorted descending so quality-first retry
     candidates = sorted([x for x in candidates if x > 0], reverse=True)
     return candidates
 
